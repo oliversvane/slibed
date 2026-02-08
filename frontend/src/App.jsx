@@ -1,11 +1,12 @@
 import React, { useMemo, useState } from "react";
 
-const DEFAULT_PROMPT = "Draft a friendly welcome message for a new user.";
+import { Button } from "./components/ui/button.jsx";
+import { Input } from "./components/ui/input.jsx";
+import { Separator } from "./components/ui/separator.jsx";
+import { Textarea } from "./components/ui/textarea.jsx";
+import { cn } from "./lib/utils.js";
 
-const initialStatus = {
-  state: "idle",
-  label: "Idle",
-};
+const DEFAULT_PROMPT = "Draft a friendly welcome message for a new user.";
 
 const statusMap = {
   idle: { label: "Idle" },
@@ -18,7 +19,6 @@ const formatTimestamp = (value) =>
   new Intl.DateTimeFormat("en", {
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit",
   }).format(value);
 
 const buildPayload = (text) => ({
@@ -69,12 +69,43 @@ const parseSseChunk = (buffer) => {
   return { events, buffer: nextBuffer };
 };
 
+const initialSessions = [
+  {
+    id: "session-1",
+    title: "Welcome sequence copy",
+    updatedAt: new Date(Date.now() - 1000 * 60 * 15),
+    messages: [
+      {
+        id: "m1",
+        role: "assistant",
+        content:
+          "Welcome! I'm here to help you craft the perfect onboarding journey.",
+      },
+    ],
+  },
+  {
+    id: "session-2",
+    title: "Product launch outline",
+    updatedAt: new Date(Date.now() - 1000 * 60 * 90),
+    messages: [
+      {
+        id: "m2",
+        role: "assistant",
+        content:
+          "Let's map out the product launch beats, from teaser to post-launch nurture.",
+      },
+    ],
+  },
+];
+
 export default function App() {
+  const [sessions, setSessions] = useState(initialSessions);
+  const [selectedSessionId, setSelectedSessionId] = useState(
+    initialSessions[0]?.id ?? null,
+  );
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
-  const [sessionId, setSessionId] = useState("");
-  const [responseText, setResponseText] = useState("");
-  const [events, setEvents] = useState([]);
-  const [status, setStatus] = useState(initialStatus);
+  const [status, setStatus] = useState({ state: "idle", label: "Idle" });
+  const [sessionFilter, setSessionFilter] = useState("");
 
   const apiBaseUrl = useMemo(() => {
     if (import.meta.env.VITE_API_BASE_URL) {
@@ -83,22 +114,79 @@ export default function App() {
     return "";
   }, []);
 
-  const statusDotClass = useMemo(() => {
-    if (status.state === "streaming") {
-      return "status-dot pending";
+  const filteredSessions = useMemo(() => {
+    if (!sessionFilter.trim()) {
+      return sessions;
     }
-    if (status.state === "error") {
-      return "status-dot error";
-    }
-    return "status-dot";
-  }, [status.state]);
+    return sessions.filter((session) =>
+      session.title.toLowerCase().includes(sessionFilter.toLowerCase()),
+    );
+  }, [sessionFilter, sessions]);
+
+  const selectedSession = sessions.find(
+    (session) => session.id === selectedSessionId,
+  );
+
+  const createLocalSession = (title) => {
+    const newSession = {
+      id: `local-${crypto.randomUUID()}`,
+      title,
+      updatedAt: new Date(),
+      messages: [],
+      isLocal: true,
+    };
+    setSessions((prev) => [newSession, ...prev]);
+    setSelectedSessionId(newSession.id);
+    return newSession;
+  };
+
+  const updateSession = (sessionId, updater) => {
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === sessionId ? updater(session) : session,
+      ),
+    );
+  };
+
+  const handleNewChat = () => {
+    createLocalSession("New conversation");
+    setPrompt("");
+    setStatus({ state: "idle", label: statusMap.idle.label });
+  };
 
   const handleSubmit = async (event) => {
     event.preventDefault();
+    if (!prompt.trim()) {
+      return;
+    }
+
+    const activeSession = selectedSession ?? createLocalSession("New chat");
+
+    updateSession(activeSession.id, (session) => ({
+      ...session,
+      updatedAt: new Date(),
+      title:
+        session.messages.length === 0
+          ? prompt.slice(0, 32)
+          : session.title,
+      messages: [
+        ...session.messages,
+        {
+          id: `user-${crypto.randomUUID()}`,
+          role: "user",
+          content: prompt,
+        },
+        {
+          id: `assistant-${crypto.randomUUID()}`,
+          role: "assistant",
+          content: "",
+          streaming: true,
+        },
+      ],
+    }));
+
+    setPrompt("");
     setStatus({ state: "streaming", label: statusMap.streaming.label });
-    setResponseText("");
-    setEvents([]);
-    setSessionId("");
 
     try {
       const response = await fetch(`${apiBaseUrl}/api/v1/chat/`, {
@@ -130,24 +218,39 @@ export default function App() {
         buffer = parsed.buffer;
 
         parsed.events.forEach((eventItem) => {
-          const timestamp = formatTimestamp(new Date());
-          setEvents((prev) => [
-            ...prev,
-            {
-              id: `${eventItem.event}-${timestamp}-${prev.length}`,
-              event: eventItem.event,
-              timestamp,
-            },
-          ]);
-
-          if (eventItem.data?.session_id) {
-            setSessionId(eventItem.data.session_id);
+          if (eventItem.event === "init") {
+            updateSession(activeSession.id, (session) => ({
+              ...session,
+              apiId: eventItem.data.session_id ?? session.apiId,
+            }));
           }
           if (eventItem.event === "delta") {
-            setResponseText((prev) => `${prev}${eventItem.data.text ?? ""}`);
+            updateSession(activeSession.id, (session) => ({
+              ...session,
+              messages: session.messages.map((message) =>
+                message.streaming
+                  ? {
+                      ...message,
+                      content: `${message.content}${eventItem.data.text ?? ""}`,
+                    }
+                  : message,
+              ),
+            }));
           }
+
           if (eventItem.event === "done") {
-            setResponseText(eventItem.data.text ?? "");
+            updateSession(activeSession.id, (session) => ({
+              ...session,
+              messages: session.messages.map((message) =>
+                message.streaming
+                  ? {
+                      ...message,
+                      content: eventItem.data.text ?? message.content,
+                      streaming: false,
+                    }
+                  : message,
+              ),
+            }));
             setStatus({ state: "complete", label: statusMap.complete.label });
           }
         });
@@ -158,77 +261,161 @@ export default function App() {
       }
     } catch (error) {
       setStatus({ state: "error", label: statusMap.error.label });
-      setEvents((prev) => [
-        ...prev,
-        {
-          id: `error-${prev.length}`,
-          event: "error",
-          timestamp: formatTimestamp(new Date()),
-        },
-      ]);
-      setResponseText(
-        `Something went wrong while streaming the response. ${error.message}`,
-      );
+      updateSession(activeSession.id, (session) => ({
+        ...session,
+        messages: session.messages.map((message) =>
+          message.streaming
+            ? {
+                ...message,
+                content: `Something went wrong while streaming. ${error.message}`,
+                streaming: false,
+              }
+            : message,
+        ),
+      }));
     }
   };
 
   return (
-    <div className="app">
-      <header>
-        <h1>Slibed LLM Messaging</h1>
-        <p>Start a session and stream tokens from the create session endpoint.</p>
-      </header>
-      <main>
-        <div className="layout">
-          <section className="card">
-            <form onSubmit={handleSubmit}>
-              <label htmlFor="prompt">Message to send</label>
-              <textarea
-                id="prompt"
+    <div className="min-h-screen bg-slate-950 text-slate-50">
+      <div className="mx-auto grid min-h-screen w-full max-w-[1400px] grid-cols-[280px_1fr]">
+        <aside className="flex flex-col border-r border-slate-800 bg-slate-900/30 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                Sessions
+              </p>
+              <h1 className="text-lg font-semibold">Slibed</h1>
+            </div>
+            <Button variant="outline" className="px-3" onClick={handleNewChat}>
+              New
+            </Button>
+          </div>
+          <div className="mt-4">
+            <Input
+              value={sessionFilter}
+              onChange={(event) => setSessionFilter(event.target.value)}
+              placeholder="Search sessions"
+            />
+          </div>
+          <Separator className="my-4" />
+          <div className="chat-scrollbar flex-1 space-y-2 overflow-y-auto pr-1">
+            {filteredSessions.length === 0 && (
+              <p className="text-sm text-slate-500">No sessions found.</p>
+            )}
+            {filteredSessions.map((session) => (
+              <button
+                key={session.id}
+                type="button"
+                onClick={() => setSelectedSessionId(session.id)}
+                className={cn(
+                  "w-full rounded-2xl border border-transparent px-3 py-3 text-left transition",
+                  session.id === selectedSessionId
+                    ? "border-slate-700 bg-slate-900"
+                    : "hover:bg-slate-900/60",
+                )}
+              >
+                <p className="truncate text-sm font-medium text-slate-100">
+                  {session.title}
+                </p>
+                <p className="text-xs text-slate-500">
+                  {formatTimestamp(session.updatedAt)}
+                </p>
+              </button>
+            ))}
+          </div>
+          <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900 p-4 text-xs text-slate-400">
+            <p className="font-semibold text-slate-200">Create session API</p>
+            <p className="mt-1">POST /api/v1/chat/ (SSE stream)</p>
+          </div>
+        </aside>
+
+        <main className="flex flex-col">
+          <header className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
+            <div>
+              <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                Chat
+              </p>
+              <h2 className="text-lg font-semibold">
+                {selectedSession?.title ?? "Start a new conversation"}
+              </h2>
+              {selectedSession?.apiId && (
+                <p className="text-xs text-slate-500">
+                  Session ID: {selectedSession.apiId}
+                </p>
+              )}
+            </div>
+            <div
+              className={cn(
+                "rounded-full border px-3 py-1 text-xs font-semibold",
+                status.state === "error"
+                  ? "border-red-500/40 text-red-300"
+                  : status.state === "streaming"
+                    ? "border-amber-400/40 text-amber-200"
+                    : "border-emerald-400/40 text-emerald-200",
+              )}
+            >
+              {status.label}
+            </div>
+          </header>
+
+          <div className="chat-scrollbar flex-1 overflow-y-auto px-6 py-6">
+            <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+              {(selectedSession?.messages ?? []).map((message) => (
+                <div
+                  key={message.id}
+                  className={cn(
+                    "flex w-full",
+                    message.role === "user" ? "justify-end" : "justify-start",
+                  )}
+                >
+                  <div
+                    className={cn(
+                      "max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-relaxed shadow-card",
+                      message.role === "user"
+                        ? "bg-slate-100 text-slate-900"
+                        : "bg-slate-900 text-slate-100",
+                    )}
+                  >
+                    {message.content ||
+                      (message.streaming && (
+                        <span className="text-slate-500">Thinking...</span>
+                      ))}
+                  </div>
+                </div>
+              ))}
+              {!selectedSession && (
+                <div className="rounded-2xl border border-slate-800 bg-slate-900/70 px-6 py-8 text-center text-slate-300">
+                  <p className="text-sm">
+                    Select a session on the left or start a new chat to begin.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <footer className="border-t border-slate-800 px-6 py-6">
+            <form
+              onSubmit={handleSubmit}
+              className="mx-auto flex w-full max-w-3xl flex-col gap-3"
+            >
+              <Textarea
                 value={prompt}
                 onChange={(event) => setPrompt(event.target.value)}
-                placeholder="Type your message here..."
+                placeholder="Send a message"
               />
-              <div className="controls">
-                <button type="submit" disabled={!prompt || status.state === "streaming"}>
-                  {status.state === "streaming" ? "Streaming..." : "Create session"}
-                </button>
-                <div className="badge">
-                  <span className={statusDotClass} />
-                  {status.label}
-                </div>
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-slate-500">
+                  Tip: set VITE_API_BASE_URL to point at the backend host.
+                </p>
+                <Button type="submit" disabled={status.state === "streaming"}>
+                  Send
+                </Button>
               </div>
-              <p className="helper">
-                This sends a POST to <code>/api/v1/chat/</code> with a
-                <code>parts</code> array containing your text prompt.
-              </p>
-              <p className="footer-note">
-                Tip: set <code>VITE_API_BASE_URL</code> to point at your backend if
-                it runs on another host.
-              </p>
             </form>
-          </section>
-
-          <section className="card">
-            <h3>Streaming response</h3>
-            <p className="helper">
-              Session ID: <strong>{sessionId || "Pending"}</strong>
-            </p>
-            <div className="response">
-              {responseText || "Response will appear here once streaming starts."}
-            </div>
-            <h4>Event timeline</h4>
-            <ul className="event-log">
-              {events.length === 0 && <li>No events yet.</li>}
-              {events.map((eventItem) => (
-                <li key={eventItem.id}>
-                  <strong>{eventItem.event}</strong> · {eventItem.timestamp}
-                </li>
-              ))}
-            </ul>
-          </section>
-        </div>
-      </main>
+          </footer>
+        </main>
+      </div>
     </div>
   );
 }
